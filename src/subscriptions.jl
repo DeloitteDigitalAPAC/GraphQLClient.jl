@@ -1,5 +1,17 @@
 const subscription_tracker = Ref{Dict}(Dict())
 
+function writews(ws::HTTP.WebSockets.WebSocket, msg)
+    if isdefined(HTTP, :send)
+        HTTP.send(ws, msg)
+    else
+        write(ws, msg)
+    end
+end
+
+function writews(ws::IO, msg)
+    write(ws, msg)
+end
+
 """
     open_subscription(fn::Function,
                       [client::Client],
@@ -93,11 +105,11 @@ function open_subscription(fn::Function,
         "payload" => payload
     )
     message_str = JSON3.write(message)
-
-    HTTP.WebSockets.open(client.ws_endpoint; retry=retry, headers=client.headers) do ws
+    throw_if_assigned = Ref{GraphQLError}()
+    HTTP.WebSockets.open(client.ws_endpoint; retry=retry, headers=client.headers, suppress_close_error=false) do ws
         # Start sub
         output_info(verbose) && println("Starting $(get_name(subscription_name)) subscription with ID $sub_id")
-        write(ws, message_str)
+        writews(ws, message_str)
         subscription_tracker[][sub_id] = "open"
 
         # Init function
@@ -120,11 +132,12 @@ function open_subscription(fn::Function,
                 output_info(verbose) && println("Subscription $sub_id stopped by the stop function supplied")
                 break
             end
-            response = JSON3.read(data::Vector{UInt8}, GQLSubscriptionResponse{output_type})
+            response = JSON3.read(data, GQLSubscriptionResponse{output_type})
             payload = response.payload
             if !isnothing(payload.errors) && !isempty(payload.errors) && throw_on_execution_error
                 subscription_tracker[][sub_id] = "errored"
-                throw(GraphQLError("Error during subscription.", payload))
+                throw_if_assigned[] = GraphQLError("Error during subscription.", payload)
+                break
             end
             # Handle multiple subs, do we need this?
             if response.id == string(sub_id)
@@ -137,6 +150,8 @@ function open_subscription(fn::Function,
             end
         end
     end
+    # We can't throw errors from the ws handle function in HTTP 1.0, as they get digested.
+    isassigned(throw_if_assigned) && throw(throw_if_assigned[])
     output_debug(verbose) && println("Finished. Closing subscription")
     subscription_tracker[][sub_id] = "closed"
     return
@@ -172,6 +187,25 @@ function async_reader_with_timeout(io::IO, subtimeout)::Channel
     return ch
 end
 
+
+function async_reader_with_timeout(ws::HTTP.WebSocket, subtimeout)::Channel
+    ch = Channel(1)
+    task = @async begin
+        reader_task = current_task()
+        function timeout_cb(timer)
+            put!(ch, :timeout)
+            Base.throwto(reader_task, InterruptException())
+        end
+        timeout = Timer(timeout_cb, subtimeout)
+        data = HTTP.receive(ws)
+        subtimeout > 0 && close(timeout) # Cancel the timeout
+        put!(ch, data)
+    end
+    bind(ch, task)
+    return ch
+end
+
+
 function async_reader_with_stopfn(io::IO, stopfn, checktime)::Channel
     ch = Channel(1) # Could we make this channel concretely typed?
     task = @async begin
@@ -192,6 +226,28 @@ function async_reader_with_stopfn(io::IO, stopfn, checktime)::Channel
     bind(ch, task)
     return ch
 end
+
+function async_reader_with_stopfn(ws::HTTP.WebSockets.WebSocket, stopfn, checktime)::Channel
+    ch = Channel(1) # Could we make this channel concretely typed?
+    task = @async begin
+        reader_task = current_task()
+        function timeout_cb(timer)
+            if stopfn()
+                put!(ch, :stopfn)
+                Base.throwto(reader_task, InterruptException())
+            else
+                timeout = Timer(timeout_cb, checktime)
+            end
+        end
+        timeout = Timer(timeout_cb, checktime)
+        data = HTTP.WebSockets.receive(ws)
+        close(timeout) # Cancel the timeout
+        put!(ch, data)
+    end
+    bind(ch, task)
+    return ch
+end
+
 
 """
     readfromwebsocket(ws::IO, stopfn, subtimeout)
@@ -219,6 +275,20 @@ function readfromwebsocket(ws::IO, stopfn, subtimeout)
         data = take!(ch_out)
     else
         data = readavailable(ws)
+    end
+    return data
+end
+
+function readfromwebsocket(ws::HTTP.WebSockets.WebSocket, stopfn, subtimeout)
+    if isnothing(stopfn) && subtimeout > 0
+        ch_out = async_reader_with_timeout(ws, subtimeout)
+        data = take!(ch_out)
+    elseif !isnothing(stopfn)
+        checktime = subtimeout > 0 ? subtimeout : 2
+        ch_out = async_reader_with_stopfn(ws, stopfn, checktime)
+        data = take!(ch_out)
+    else
+        data = HTTP.receive(ws)
     end
     return data
 end
